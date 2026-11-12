@@ -1,0 +1,127 @@
+name: Build APK (teste)
+
+# Compila o BOTWRecompAndroid com a correção das texturas reduzidas e publica o APK numa "Release".
+# Rodar à mão: aba Actions > "Build APK (teste)" > Run workflow.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK / NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+            "ndk;30.0.16248370" "cmake;3.30.4" "platforms;android-36" "build-tools;36.0.0"
+
+      # SDL3, shaderc etc. (a 1ª vez demora; depois vem do cache)
+      - name: Cache das dependências
+        id: depscache
+        uses: actions/cache@v4
+        with:
+          path: android/deps/out
+          key: deps-${{ hashFiles('android/deps/*.sh', 'android/deps/*.patch') }}
+
+      - name: Compilar dependências
+        if: steps.depscache.outputs.cache-hit != 'true'
+        run: bash android/deps/build_deps.sh
+
+      # FFmpeg (vídeos do jogo). Se falhar, o APK sai sem vídeos.
+      - name: FFmpeg (opcional)
+        if: steps.depscache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          ANDROID_NDK_LINUX: /usr/local/lib/android/sdk/ndk/30.0.16248370
+        run: bash android/deps/build_ffmpeg.sh
+
+      - name: Aplicar a correção das texturas reduzidas
+        run: |
+          python3 - <<'PY'
+          p = 'runtime/nvn/vulkan/exec.c'
+          s = open(p, encoding='utf-8').read()
+
+          def sub(old, new):
+              global s
+              assert s.count(old) == 1, 'trecho não encontrado (o código mudou?): ' + old[:60]
+              s = s.replace(old, new)
+
+          sub(r'''    if (b->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) return;
+              if (b->astc_bw) {  // (blocks would need the CPU decode: not seen in the game yet)'''.replace('\n          ', '\n'),
+              r'''    if (b->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) return;
+              if (b->skip) {  // half-size texture: its image starts at guest level b->skip
+                  static int nlog;
+                  if (nlog++ < 20) LOG("[vk] buffer -> half-size texture %ux%u: guest level %d (the image starts at %u)\n", t->width, t->height, level, b->skip);
+                  if (level < (int)b->skip) return;
+                  level -= (int)b->skip;
+              }
+              if (b->astc_bw) {  // (blocks would need the CPU decode: not seen in the game yet)'''.replace('\n          ', '\n'))
+
+          sub(r'''    TexBackend *b = vk_tex(t, false);
+              float tsx, tsy;
+              renderer_texture_scale(t, &tsx, &tsy);'''.replace('\n          ', '\n'),
+              r'''    TexBackend *b = vk_tex(t, false);
+              if (b->skip) {  // half-size texture: the CPU wants guest-sized texels of a level the image lacks
+                  if (level < (int)b->skip) return;
+                  level -= (int)b->skip;
+              }
+              float tsx, tsy;
+              renderer_texture_scale(t, &tsx, &tsy);'''.replace('\n          ', '\n'))
+
+          sub('    if (slv >= s->levels || dlv >= d->levels || sly >= s->layers || dly >= d->layers) return;',
+              '    if (s->skip) { if (slv < s->skip) return; slv -= s->skip; }\n'
+              '    if (d->skip) { if (dlv < d->skip) return; dlv -= d->skip; }\n'
+              '    if (slv >= s->levels || dlv >= d->levels || sly >= s->layers || dly >= d->layers) return;')
+
+          open(p, 'w', encoding='utf-8').write(s)
+          print('correção aplicada')
+          PY
+          git diff --stat
+
+      # Instala ao lado do app original (outro nome de pacote): não apaga seus dados.
+      - name: Pacote de teste
+        run: sed -i 's/applicationId = "com.botwrecomp.android"/applicationId = "com.botwrecomp.android.test"/' android/botwrecompandroid/app/build.gradle.kts
+
+      # Mesma assinatura em todas as builds (para poder atualizar por cima).
+      - name: Chave de assinatura (cache)
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: debug-keystore-v1
+
+      - name: Criar chave se não existir
+        run: |
+          mkdir -p ~/.android
+          [ -f ~/.android/debug.keystore ] || keytool -genkeypair -keystore ~/.android/debug.keystore \
+            -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 \
+            -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Compilar o APK
+        working-directory: android/botwrecompandroid
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Publicar o APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          APK=$(find android/botwrecompandroid/app/build/outputs/apk/release -name '*.apk' | head -n 1)
+          cp "$APK" botwrecomp-test.apk
+          gh release create "teste-${{ github.run_number }}" botwrecomp-test.apk \
+            --repo "${{ github.repository }}" --prerelease \
+            --title "Teste ${{ github.run_number }}" \
+            --notes "APK de teste com a correção das texturas reduzidas (pacote com.botwrecomp.android.test)."
